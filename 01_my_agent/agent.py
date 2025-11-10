@@ -1,4 +1,4 @@
-from google.adk.agents.llm_agent import Agent
+from google.adk.agents import Agent
 
 # Mock tool implementation
 def get_current_time(city: str) -> dict:

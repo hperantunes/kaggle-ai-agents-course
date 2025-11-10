@@ -1,5 +1,5 @@
 from google.adk.agents import Agent
-from google.adk.tools import google_search  # Import the tool
+from google.adk.tools import google_search
 
 root_agent = Agent(
    name="basic_search_agent",
@@ -9,5 +9,5 @@ root_agent = Agent(
    tools=[google_search]
 )
 
-# Execute once before running the agent for the first time:
+# On Windows, you might neet to execute once before running this agent for the first time:
 # export SSL_CERT_FILE="$(python -m certifi)"
