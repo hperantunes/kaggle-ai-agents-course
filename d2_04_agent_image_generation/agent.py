@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Coroutine
 
+
+JsonDict = Dict[str, Any]
+
+# Cap inline payload previews to keep the console readable.
+MAX_BASE64_PREVIEW = 10 * 1024  # 10 KB
+
 from google.adk import runners as adk_runners
 from google.genai import types
 
@@ -140,7 +146,7 @@ def _safe_b64decode(data: str) -> bytes:
 	return base64.b64decode(data)
 
 
-def _summarize_inline_image(part: Dict[str, Any]) -> Optional[str]:
+def _summarize_inline_image(part: JsonDict) -> Optional[str]:
 	"""Produce a short message describing an inline MCP image payload."""
 	data = part.get("data")
 	if not isinstance(data, str) or not data:
@@ -156,10 +162,76 @@ def _summarize_inline_image(part: Dict[str, Any]) -> Optional[str]:
 	else:
 		status = "looks like a valid image"
 
+	if len(data) > MAX_BASE64_PREVIEW:
+		payload_note = (
+			f"Base64 omitted ({len(data)} chars exceeds {MAX_BASE64_PREVIEW}-char limit)."
+		)
+	else:
+		payload_note = f"Base64: {data}"
+
 	return (
 		f"Inline image summary: {len(image_bytes)} bytes ({mime_type}, {status}). "
-		f"Base64: {data}"
+		f"{payload_note}"
 	)
+
+
+def _count_content_parts(entries: Sequence[Any]) -> tuple[int, int]:
+	text_parts = 0
+	image_parts = 0
+	for entry in entries:
+		if not isinstance(entry, dict):
+			continue
+		type_name = entry.get("type")
+		if type_name == "text":
+			text_parts += 1
+		elif type_name == "image":
+			image_parts += 1
+	return text_parts, image_parts
+
+
+def _print_inline_images(author: str, entries: Sequence[Any]) -> None:
+	for entry in entries:
+		if isinstance(entry, dict) and entry.get("type") == "image":
+			summary = _summarize_inline_image(entry)
+			if summary:
+				print(f"{author} > {summary}")
+
+
+def _print_status_block(author: str, response: JsonDict) -> None:
+	byte_count = response.get("bytes")
+	mime_type = response.get("mime_type")
+	sample = response.get("sample")
+	if isinstance(byte_count, int):
+		info = f"{byte_count} bytes"
+		if mime_type:
+			info += f" ({mime_type})"
+		print(f"{author} > Image summary: {info}")
+	if sample:
+		print(f"{author} > Sample base64: {sample}")
+
+
+def _render_dict_response(author: str, response: JsonDict) -> None:
+	content_entries = response.get("content")
+	if isinstance(content_entries, list):
+		text_parts, image_parts = _count_content_parts(content_entries)
+		print(
+			f"{author} > Tool returned {text_parts} text parts and {image_parts} image parts."
+		)
+		_print_inline_images(author, content_entries)
+		return
+
+	status = response.get("status")
+	message = response.get("message")
+	if status and message:
+		print(f"{author} > {message} (status: {status})")
+	elif status:
+		print(f"{author} > Tool status: {status}")
+	elif message:
+		print(f"{author} > {message}")
+	else:
+		print(f"{author} > Tool result: {response}")
+
+	_print_status_block(author, response)
 
 
 def _coerce_to_dict(value: Any) -> Dict[str, Any]:
@@ -241,7 +313,11 @@ async def show_image_summary(
 		"message": "Image payload received.",
 		"mime_type": mime_type,
 		"bytes": len(image_bytes),
-		"sample": image_base64,
+		"sample": (
+			image_base64
+			if len(image_base64) <= MAX_BASE64_PREVIEW
+			else f"[omitted: payload {len(image_base64)} chars exceeds {MAX_BASE64_PREVIEW}-char limit]"
+		),
 	}
 
 
@@ -276,10 +352,9 @@ def requires_bulk_confirmation(**kwargs) -> bool:
 	"""Returns True when a tool call appears to request multiple images."""
 
 	for key in _BULK_COUNT_KEYS:
-		if key in kwargs:
-			count = _coerce_count(kwargs[key])
-			if count is not None:
-				return count > 1
+		count = _coerce_count(kwargs.get(key))
+		if count is not None and count > 1:
+			return True
 
 	prompts = kwargs.get("prompts")
 	if isinstance(prompts, Sequence) and not isinstance(prompts, (str, bytes)):
@@ -350,16 +425,6 @@ IMAGE_SERVER_CONFIGS: Sequence[_ImageServerConfig] = (
 		tool_filter=("getTinyImage",),
 		tool_name_prefix="everything_",
 		timeout=30,
-	),
-	_ImageServerConfig(
-		id="everart",
-		label="EverArt (Flux/SD3.5/Recraft)",
-		summary="High-quality art generation across multiple models. Requires EVERART_API_KEY.",
-		command="npx",
-		args=("-y", "@modelcontextprotocol/server-everart"),
-		required_env=("EVERART_API_KEY",),
-		tool_name_prefix="everart_",
-		timeout=60,
 	),
 	_ImageServerConfig(
 		id="replicate",
@@ -493,6 +558,7 @@ async def _ensure_session(user_id: str, session_id: str) -> None:
 
 
 def _maybe_render_tool_result(event, verbose: bool) -> None:
+	"""Render tool outputs only when verbose logging is disabled."""
 	if verbose:
 		return
 	content = getattr(event, "content", None)
@@ -508,46 +574,7 @@ def _maybe_render_tool_result(event, verbose: bool) -> None:
 			continue
 		response = getattr(function_response, "response", None)
 		if isinstance(response, dict):
-			if "content" in response and isinstance(response["content"], list):
-				text_parts = sum(
-					1
-					for entry in response["content"]
-					if isinstance(entry, dict) and entry.get("type") == "text"
-				)
-				image_parts = sum(
-					1
-					for entry in response["content"]
-					if isinstance(entry, dict) and entry.get("type") == "image"
-				)
-				print(
-					f"{event.author} > Tool returned {text_parts} text parts and {image_parts} image parts."
-				)
-				for entry in response["content"]:
-					if isinstance(entry, dict) and entry.get("type") == "image":
-						summary = _summarize_inline_image(entry)
-						if summary:
-							print(f"{event.author} > {summary}")
-				continue
-			status = response.get("status")
-			message = response.get("message")
-			if status and message:
-				print(f"{event.author} > {message} (status: {status})")
-			elif status:
-				print(f"{event.author} > Tool status: {status}")
-			elif message:
-				print(f"{event.author} > {message}")
-			else:
-				print(f"{event.author} > Tool result: {response}")
-			byte_count = response.get("bytes")
-			mime_type = response.get("mime_type")
-			sample = response.get("sample")
-			if isinstance(byte_count, int):
-				info = f"{byte_count} bytes"
-				if mime_type:
-					info += f" ({mime_type})"
-				print(f"{event.author} > Image summary: {info}")
-			if sample:
-				print(f"{event.author} > Sample base64: {sample}")
+			_render_dict_response(event.author, response)
 		elif response is not None:
 			print(f"{event.author} > Tool result: {response}")
 
