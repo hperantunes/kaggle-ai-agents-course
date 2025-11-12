@@ -3,12 +3,11 @@ import asyncio
 import queue
 import os
 import sys
-import uuid
 import threading
-from collections import OrderedDict
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Generator, TypeVar, Coroutine
+from typing import Any, Dict, Optional, Generator, Coroutine
 
 from google.adk import runners as adk_runners
 from google.genai import types
@@ -18,115 +17,102 @@ from google.adk.models.google_llm import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
-from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
-from google.adk.tools.tool_context import ToolContext
-from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from mcp import StdioServerParameters
-
 from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.tool_context import ToolContext
 
 
-T = TypeVar("T")
+class RunnerBridge:
+    """Small helper that lets the sync CLI talk to the async ADK runner."""
 
-_LOOP_LOCK = threading.Lock()
-_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_LOOP_THREAD: Optional[threading.Thread] = None
-
-
-def _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-
-def _ensure_loop_running() -> asyncio.AbstractEventLoop:
-    global _EVENT_LOOP, _LOOP_THREAD
-    with _LOOP_LOCK:
-        if _EVENT_LOOP and not _EVENT_LOOP.is_closed():
-            return _EVENT_LOOP
-
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(
-            target=_loop_worker,
-            args=(loop,),
+    def __init__(self, runner: Runner) -> None:
+        self._runner = runner
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop_worker,
             name="shipping-agent-loop",
             daemon=True,
         )
-        _EVENT_LOOP = loop
-        _LOOP_THREAD = thread
-        thread.start()
-        return loop
+        self._thread.start()
+        self._closed = False
 
+    def _loop_worker(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
-def _run_coroutine(coro: Coroutine[Any, Any, T]) -> T:
-    loop = _ensure_loop_running()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    try:
-        return future.result()
-    except KeyboardInterrupt:
-        future.cancel()
-        raise
-
-
-def _stream_agent_events(
-    *,
-    user_id: str,
-    session_id: str,
-    content: types.Content,
-) -> Generator[Any, None, None]:
-    loop = _ensure_loop_running()
-    event_queue: "queue.Queue[Any]" = queue.Queue()
-
-    async def _invoke() -> None:
+    def run(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        if self._closed:
+            raise RuntimeError("RunnerBridge is already closed.")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
-            async for event in shipping_runner.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=content,
-            ):
-                event_queue.put(event)
-        except BaseException as exc:  # noqa: BLE001 - propagate async errors to caller
-            event_queue.put(exc)
+            return future.result()
+        except KeyboardInterrupt:
+            future.cancel()
+            raise
+
+    def stream_events(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        content: types.Content,
+    ) -> Generator[Any, None, None]:
+        if self._closed:
+            raise RuntimeError("RunnerBridge is already closed.")
+
+        event_queue: "queue.Queue[Any]" = queue.Queue()
+
+        async def _invoke() -> None:
+            try:
+                async for event in self._runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=content,
+                ):
+                    event_queue.put(event)
+            except BaseException as exc:  # noqa: BLE001 - bubble up async errors
+                event_queue.put(exc)
+            finally:
+                event_queue.put(None)
+
+        asyncio.run_coroutine_threadsafe(_invoke(), self._loop)
+
+        pending_exc: Optional[BaseException] = None
+        while True:
+            item = event_queue.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                pending_exc = item
+                continue
+            yield item
+
+        if pending_exc is not None:
+            raise pending_exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._runner.close(), self._loop)
+            future.result()
+        except RuntimeError as exc:
+            print(f"Warning: failed to close runner cleanly: {exc}", file=sys.stderr)
         finally:
-            event_queue.put(None)
-
-    asyncio.run_coroutine_threadsafe(_invoke(), loop)
-
-    pending_exc: Optional[BaseException] = None
-    while True:
-        item = event_queue.get()
-        if item is None:
-            break
-        if isinstance(item, BaseException):
-            pending_exc = item
-            continue
-        yield item
-
-    if pending_exc is not None:
-        raise pending_exc
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+            self._loop.close()
+            self._closed = True
 
 
-def _shutdown_loop() -> None:
-    global _EVENT_LOOP, _LOOP_THREAD
-    with _LOOP_LOCK:
-        loop = _EVENT_LOOP
-        thread = _LOOP_THREAD
-        if not loop:
-            return
-        if loop.is_closed():
-            _EVENT_LOOP = None
-            _LOOP_THREAD = None
-            return
-        loop.call_soon_threadsafe(loop.stop)
-
-    if thread and thread.is_alive():
-        thread.join()
-
-    with _LOOP_LOCK:
-        if loop and not loop.is_closed():
-            loop.close()
-        _EVENT_LOOP = None
-        _LOOP_THREAD = None
+def _coerce_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        return dict(value)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 - best effort conversion
+        return {}
 
 
 def _load_local_env() -> None:
@@ -268,22 +254,6 @@ shipping_runner = Runner(
     app=shipping_app,  # Pass the app instead of the agent
     session_service=session_service,
 )
-
-
-def _close_runner() -> None:
-    """Close the runner, reporting cleanup issues to stderr."""
-
-    if _EVENT_LOOP is None or _EVENT_LOOP.is_closed():
-        return
-
-    try:
-        _run_coroutine(shipping_runner.close())
-    except RuntimeError as exc:
-        print(f"Warning: failed to close runner cleanly: {exc}", file=sys.stderr)
-    finally:
-        _shutdown_loop()
-
-
 async def _ensure_session(user_id: str, session_id: str) -> None:
     """Create the session lazily if it does not already exist."""
 
@@ -363,7 +333,8 @@ def main() -> None:
     args = parser.parse_args()
 
     session_id = args.session or str(uuid.uuid4())
-    pending_confirmations: "OrderedDict[str, PendingConfirmation]" = OrderedDict()
+    bridge = RunnerBridge(shipping_runner)
+    pending_confirmations: Dict[str, PendingConfirmation] = {}
 
     def _collect_confirmation_requests(event: Any) -> None:
         content = getattr(event, "content", None)
@@ -373,40 +344,20 @@ def main() -> None:
         for part in parts:
             function_call = getattr(part, "function_call", None)
             if function_call and function_call.name == "adk_request_confirmation":
-                raw_args = getattr(function_call, "args", {}) or {}
-                if isinstance(raw_args, dict):
-                    args_dict = raw_args
-                else:
-                    try:
-                        args_dict = dict(raw_args)
-                    except Exception:  # noqa: BLE001 - defensive conversion
-                        args_dict = {}
-                original_raw = args_dict.get("originalFunctionCall") or {}
-                if isinstance(original_raw, dict):
-                    original_call = original_raw
-                else:
-                    try:
-                        original_call = dict(original_raw)
-                    except Exception:  # noqa: BLE001 - fallback when conversion fails
-                        original_call = {}
+                args_dict = _coerce_to_dict(getattr(function_call, "args", {}) or {})
+                original_call = _coerce_to_dict(args_dict.get("originalFunctionCall"))
+                tool_conf = _coerce_to_dict(args_dict.get("toolConfirmation"))
 
-                tool_conf_raw = args_dict.get("toolConfirmation") or {}
-                if isinstance(tool_conf_raw, dict):
-                    tool_conf = tool_conf_raw
-                else:
-                    try:
-                        tool_conf = dict(tool_conf_raw)
-                    except Exception:  # noqa: BLE001 - fallback when conversion fails
-                        tool_conf = {}
-
-                payload_value = tool_conf.get("payload") if isinstance(tool_conf, dict) else None
+                payload_value = tool_conf.get("payload")
                 payload = payload_value if isinstance(payload_value, dict) else None
+                original_args_value = original_call.get("args")
+                original_args = original_args_value if isinstance(original_args_value, dict) else None
                 pending_confirmations[function_call.id] = PendingConfirmation(
                     call_id=function_call.id,
                     hint=str(tool_conf.get("hint", "")).strip(),
                     payload=payload,
                     original_tool=original_call.get("name"),
-                    original_args=original_call.get("args") if isinstance(original_call.get("args"), dict) else None,
+                    original_args=original_args,
                 )
 
             function_response = getattr(part, "function_response", None)
@@ -415,8 +366,8 @@ def main() -> None:
 
     def _send_content(content: types.Content) -> None:
         try:
-            _run_coroutine(_ensure_session(args.user, session_id))
-            for event in _stream_agent_events(
+            bridge.run(_ensure_session(args.user, session_id))
+            for event in bridge.stream_events(
                 user_id=args.user,
                 session_id=session_id,
                 content=content,
@@ -494,9 +445,11 @@ def main() -> None:
                 print("Please reply with 'y' to approve or 'n' to reject.")
 
     if args.message:
-        _dispatch_text(args.message)
-        _handle_pending_confirmations()
-        _close_runner()
+        try:
+            _dispatch_text(args.message)
+            _handle_pending_confirmations()
+        finally:
+            bridge.close()
         return
 
     print(
@@ -522,7 +475,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nSession interrupted by user.")
     finally:
-        _close_runner()
+        bridge.close()
 
 
 if __name__ == "__main__":
