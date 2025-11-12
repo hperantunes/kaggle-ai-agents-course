@@ -3,7 +3,10 @@ import argparse
 import os
 import sys
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from google.adk import runners as adk_runners
 from google.genai import types
@@ -62,6 +65,15 @@ LARGE_ORDER_THRESHOLD = 5
 
 class ShippingAgent(LlmAgent):
     """Local subclass keeps module path anchored for runner metadata."""
+
+
+@dataclass
+class PendingConfirmation:
+    call_id: str
+    hint: str
+    payload: Optional[Dict[str, Any]]
+    original_tool: Optional[str]
+    original_args: Optional[Dict[str, Any]]
 
 
 def place_shipping_order(
@@ -242,14 +254,58 @@ def main() -> None:
     args = parser.parse_args()
 
     session_id = args.session or str(uuid.uuid4())
+    pending_confirmations: "OrderedDict[str, PendingConfirmation]" = OrderedDict()
 
-    def dispatch(user_message: str) -> None:
+    def _collect_confirmation_requests(event: Any) -> None:
+        content = getattr(event, "content", None)
+        parts = getattr(content, "parts", None)
+        if not parts:
+            return
+        for part in parts:
+            function_call = getattr(part, "function_call", None)
+            if function_call and function_call.name == "adk_request_confirmation":
+                raw_args = getattr(function_call, "args", {}) or {}
+                if isinstance(raw_args, dict):
+                    args_dict = raw_args
+                else:
+                    try:
+                        args_dict = dict(raw_args)
+                    except Exception:  # noqa: BLE001 - defensive conversion
+                        args_dict = {}
+                original_raw = args_dict.get("originalFunctionCall") or {}
+                if isinstance(original_raw, dict):
+                    original_call = original_raw
+                else:
+                    try:
+                        original_call = dict(original_raw)
+                    except Exception:  # noqa: BLE001 - fallback when conversion fails
+                        original_call = {}
+
+                tool_conf_raw = args_dict.get("toolConfirmation") or {}
+                if isinstance(tool_conf_raw, dict):
+                    tool_conf = tool_conf_raw
+                else:
+                    try:
+                        tool_conf = dict(tool_conf_raw)
+                    except Exception:  # noqa: BLE001 - fallback when conversion fails
+                        tool_conf = {}
+
+                payload_value = tool_conf.get("payload") if isinstance(tool_conf, dict) else None
+                payload = payload_value if isinstance(payload_value, dict) else None
+                pending_confirmations[function_call.id] = PendingConfirmation(
+                    call_id=function_call.id,
+                    hint=str(tool_conf.get("hint", "")).strip(),
+                    payload=payload,
+                    original_tool=original_call.get("name"),
+                    original_args=original_call.get("args") if isinstance(original_call.get("args"), dict) else None,
+                )
+
+            function_response = getattr(part, "function_response", None)
+            if function_response and function_response.name == "adk_request_confirmation":
+                pending_confirmations.pop(function_response.id, None)
+
+    def _send_content(content: types.Content) -> None:
         asyncio.run(_ensure_session(args.user, session_id))
-        content = types.Content(
-            role="user",
-            parts=[types.Part(text=user_message)],
-        )
-
         try:
             for event in shipping_runner.run(
                 user_id=args.user,
@@ -258,11 +314,79 @@ def main() -> None:
             ):
                 adk_runners.print_event(event, verbose=args.verbose)
                 _maybe_render_tool_result(event, args.verbose)
+                _collect_confirmation_requests(event)
         except Exception as exc:  # noqa: BLE001 - surface runtime issues for CLI users
             print(f"Error while running agent: {exc}", file=sys.stderr)
 
+    def _dispatch_text(user_message: str) -> None:
+        content = types.Content(role="user", parts=[types.Part(text=user_message)])
+        _send_content(content)
+
+    def _send_confirmation_response(request: PendingConfirmation, *, confirmed: bool) -> None:
+        response_payload: Dict[str, Any] = {"confirmed": confirmed}
+        if request.payload is not None:
+            response_payload["payload"] = request.payload
+        pending_confirmations.pop(request.call_id, None)
+        content = types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="adk_request_confirmation",
+                        id=request.call_id,
+                        response=response_payload,
+                    )
+                )
+            ],
+        )
+        _send_content(content)
+
+    def _describe_request(request: PendingConfirmation) -> str:
+        payload = request.payload or {}
+        description_parts: list[str] = []
+        if "num_containers" in payload:
+            description_parts.append(f"{payload['num_containers']} containers")
+        if "destination" in payload:
+            destination_text = f"to {payload['destination']}"
+            if description_parts:
+                description_parts[-1] = f"{description_parts[-1]} {destination_text}"
+            else:
+                description_parts.append(destination_text)
+        extras = {k: v for k, v in payload.items() if k not in {"num_containers", "destination"}}
+        if extras:
+            description_parts.append(str(extras))
+        if not description_parts and request.original_args:
+            description_parts.append(str(request.original_args))
+        return " ".join(description_parts)
+
+    def _handle_pending_confirmations() -> None:
+        while pending_confirmations:
+            call_id, request = next(iter(pending_confirmations.items()))
+            details = _describe_request(request)
+            print()
+            print("Confirmation required:")
+            if request.original_tool:
+                print(f"  Tool: {request.original_tool}")
+            if details:
+                print(f"  Details: {details}")
+            if request.hint:
+                print(f"  Hint: {request.hint}")
+            while True:
+                try:
+                    choice = input("Approve this tool call? [y/n]: ").strip().lower()
+                except EOFError:
+                    choice = ""
+                if choice in {"y", "yes"}:
+                    _send_confirmation_response(request, confirmed=True)
+                    break
+                if choice in {"n", "no"}:
+                    _send_confirmation_response(request, confirmed=False)
+                    break
+                print("Please reply with 'y' to approve or 'n' to reject.")
+
     if args.message:
-        dispatch(args.message)
+        _dispatch_text(args.message)
+        _handle_pending_confirmations()
         _close_runner()
         return
 
@@ -284,7 +408,8 @@ def main() -> None:
             if user_input.lower() in {"exit", "quit"}:
                 break
 
-            dispatch(user_input)
+            _dispatch_text(user_input)
+            _handle_pending_confirmations()
     except KeyboardInterrupt:
         print("\nSession interrupted by user.")
     finally:
