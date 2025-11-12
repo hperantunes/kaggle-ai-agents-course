@@ -115,6 +115,23 @@ class RunnerBridge:
 			self._closed = True
 
 
+
+def _looks_like_image(image_bytes: bytes, mime_type: str) -> bool:
+	header = image_bytes[:12]
+	if not header:
+		return False
+	mime_lower = mime_type.lower()
+	if mime_lower == "image/png":
+		return header.startswith(b"\x89PNG\r\n\x1a\n")
+	if mime_lower in {"image/jpeg", "image/jpg"}:
+		return header.startswith(b"\xff\xd8\xff")
+	if mime_lower == "image/webp":
+		return header.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP"
+	if mime_lower == "image/gif":
+		return header.startswith((b"GIF87a", b"GIF89a"))
+	return True
+
+
 def _coerce_to_dict(value: Any) -> Dict[str, Any]:
 	if isinstance(value, dict):
 		return value
@@ -159,19 +176,19 @@ retry_config = types.HttpRetryOptions(
 )
 
 
-async def persist_image_artifact(
+async def show_image_summary(
 	image_base64: str,
 	*,
 	mime_type: str = "image/png",
 	filename: Optional[str] = None,
 	tool_context: ToolContext,
 ) -> dict:
-	"""Stores a base64 image as an artifact and writes a copy next to the script."""
+	"""Return a short summary of the base64 payload instead of persisting it."""
 
 	if not image_base64:
 		return {
 			"status": "error",
-			"message": "image_base64 is required to persist an image artifact.",
+			"message": "image_base64 is required to inspect an image payload.",
 		}
 
 	try:
@@ -182,51 +199,19 @@ async def persist_image_artifact(
 			"message": f"Failed to decode base64 image payload: {exc}",
 		}
 
-	extension = mime_type.split("/")[-1] if "/" in mime_type else "bin"
-	artifact_name = filename or f"mcp-image-{uuid.uuid4()}.{extension}"
-	artifact_part = types.Part(
-		inline_data=types.Blob(
-			mime_type=mime_type,
-			data=image_bytes,
-		)
-	)
-
-	local_path = Path(__file__).resolve().parent / artifact_name
-	try:
-		local_path.write_bytes(image_bytes)
-	except OSError as exc:
+	if not _looks_like_image(image_bytes, mime_type):
 		return {
-			"status": "error",
-			"message": f"Failed to write image to disk: {exc}",
+			"status": "warning",
+			"message": "Payload decoded, but header does not look like a standard image.",
+			"bytes": len(image_bytes),
 		}
-
-	artifact_uri: Optional[str] = None
-	version: Optional[str] = None
-	save_message = "Image saved to disk."
-
-	try:
-		version = await asyncio.wait_for(
-			tool_context.save_artifact(artifact_name, artifact_part),
-			timeout=5,
-		)
-		artifact_uri = f"artifact://{artifact_name}"
-		save_message = (
-			"Image saved to disk and persisted as an artifact. Reference artifact_uri "
-			"or the local file path in your summary."
-		)
-	except (asyncio.TimeoutError, ValueError) as exc:
-		save_message = (
-			"Image saved to disk. Artifact persistence is unavailable "
-			f"({exc})."
-		)
 
 	return {
 		"status": "success",
-		"artifact": artifact_name,
-		"artifact_uri": artifact_uri,
-		"version": version,
-		"local_path": str(local_path),
-		"message": save_message,
+		"message": "Image payload received.",
+		"mime_type": mime_type,
+		"bytes": len(image_bytes),
+		"sample": image_base64[:60] + ("..." if len(image_base64) > 60 else ""),
 	}
 
 
@@ -433,8 +418,8 @@ instruction = (
 	"- When the user requests multiple images, set the tool arguments (e.g., image_count) "
 	"accordingly. Calls requesting more than one image trigger a confirmation pause; wait "
 	"for approval before proceeding.\n"
-	"- After receiving base64 image data from any tool, immediately call persist_image_artifact "
-	"so ADK Web can render it, then reference the artifact URI with Markdown syntax.\n"
+	"- After receiving base64 image data from any tool, call show_image_summary to confirm "
+	"what came back, then describe the result in Markdown.\n"
 	"- If a tool returns URLs instead of base64 data, surface the links and offer to download "
 	"them if needed.\n"
 	"- If no configured server can satisfy the request, explain what setup is missing and "
@@ -446,7 +431,7 @@ root_agent = LlmAgent(
 	model=Gemini(model="gemini-2.5-flash", retry_options=retry_config),
 	name="mcp_image_agent",
 	instruction=instruction,
-	tools=[*IMAGE_TOOLSETS, persist_image_artifact],
+	tools=[*IMAGE_TOOLSETS, show_image_summary],
 )
 
 image_app = App(
@@ -510,7 +495,6 @@ def _maybe_render_tool_result(event, verbose: bool) -> None:
 				continue
 			status = response.get("status")
 			message = response.get("message")
-			local_path = response.get("local_path")
 			if status and message:
 				print(f"{event.author} > {message} (status: {status})")
 			elif status:
@@ -519,8 +503,16 @@ def _maybe_render_tool_result(event, verbose: bool) -> None:
 				print(f"{event.author} > {message}")
 			else:
 				print(f"{event.author} > Tool result: {response}")
-			if local_path:
-				print(f"{event.author} > Image saved to: {local_path}")
+			byte_count = response.get("bytes")
+			mime_type = response.get("mime_type")
+			sample = response.get("sample")
+			if isinstance(byte_count, int):
+				info = f"{byte_count} bytes"
+				if mime_type:
+					info += f" ({mime_type})"
+				print(f"{event.author} > Image summary: {info}")
+			if sample:
+				print(f"{event.author} > Sample base64: {sample}")
 		elif response is not None:
 			print(f"{event.author} > Tool result: {response}")
 
