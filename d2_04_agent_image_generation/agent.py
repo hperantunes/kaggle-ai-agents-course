@@ -156,10 +156,9 @@ def _summarize_inline_image(part: Dict[str, Any]) -> Optional[str]:
 	else:
 		status = "looks like a valid image"
 
-	sample = data[:60] + ("..." if len(data) > 60 else "")
 	return (
 		f"Inline image summary: {len(image_bytes)} bytes ({mime_type}, {status}). "
-		f"Sample base64: {sample}"
+		f"Base64: {data}"
 	)
 
 
@@ -242,7 +241,7 @@ async def show_image_summary(
 		"message": "Image payload received.",
 		"mime_type": mime_type,
 		"bytes": len(image_bytes),
-		"sample": image_base64[:60] + ("..." if len(image_base64) > 60 else ""),
+		"sample": image_base64,
 	}
 
 
