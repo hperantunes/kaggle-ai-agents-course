@@ -33,7 +33,7 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools.tool_context import ToolContext
 
 # Usage: activate the project virtualenv, then run `python agent.py` for an
-# interactive art session or `python agent.py --message "Generate a neon fox"`
+# interactive art session or `python agent.py --message "Generate five tiny images"`
 # for a one-shot prompt.
 
 
