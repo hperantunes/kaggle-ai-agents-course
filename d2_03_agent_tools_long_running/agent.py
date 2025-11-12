@@ -21,6 +21,9 @@ from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 
+# Usage: activate the project virtualenv, then run `python agent.py` for an
+# interactive session or `python agent.py --message "Ship 8 containers to Hamburg"`
+# for a one-shot request.
 
 class RunnerBridge:
     """Small helper that lets the sync CLI talk to the async ADK runner."""
