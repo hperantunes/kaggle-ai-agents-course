@@ -1,16 +1,13 @@
 import argparse
-import asyncio
 import base64
 import binascii
 import os
-import queue
 import sys
-import threading
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional, Coroutine
+from typing import Any, Dict, Optional
 
 
 JsonDict = Dict[str, Any]
@@ -32,94 +29,16 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools.tool_context import ToolContext
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.common import coerce_to_dict, load_local_env
+from utils.runner_bridge import RunnerBridge
+
 # Usage: activate the project virtualenv, then run `python agent.py` for an
 # interactive art session or `python agent.py --message "Generate five tiny images"`
 # for a one-shot prompt.
-
-
-class RunnerBridge:
-	"""Sync-friendly wrapper around the asynchronous ADK runner."""
-
-	def __init__(self, runner: Runner) -> None:
-		self._runner = runner
-		self._loop = asyncio.new_event_loop()
-		self._thread = threading.Thread(
-			target=self._loop_worker,
-			name="image-agent-loop",
-			daemon=True,
-		)
-		self._thread.start()
-		self._closed = False
-
-	def _loop_worker(self) -> None:
-		asyncio.set_event_loop(self._loop)
-		self._loop.run_forever()
-
-	def run(self, coro: Coroutine[Any, Any, Any]) -> Any:
-		if self._closed:
-			raise RuntimeError("RunnerBridge is already closed.")
-		future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-		try:
-			return future.result()
-		except KeyboardInterrupt:
-			future.cancel()
-			raise
-
-	def stream_events(
-		self,
-		*,
-		user_id: str,
-		session_id: str,
-		content: types.Content,
-	) -> Generator[Any, None, None]:
-		if self._closed:
-			raise RuntimeError("RunnerBridge is already closed.")
-
-		event_queue: "queue.Queue[Any]" = queue.Queue()
-
-		async def _invoke() -> None:
-			try:
-				async for event in self._runner.run_async(
-					user_id=user_id,
-					session_id=session_id,
-					new_message=content,
-				):
-					event_queue.put(event)
-			except BaseException as exc:  # noqa: BLE001 - surface async failures
-				event_queue.put(exc)
-			finally:
-				event_queue.put(None)
-
-		asyncio.run_coroutine_threadsafe(_invoke(), self._loop)
-
-		pending_exc: Optional[BaseException] = None
-		while True:
-			item = event_queue.get()
-			if item is None:
-				break
-			if isinstance(item, BaseException):
-				pending_exc = item
-				continue
-			yield item
-
-		if pending_exc is not None:
-			raise pending_exc
-
-	def close(self) -> None:
-		if self._closed:
-			return
-
-		try:
-			future = asyncio.run_coroutine_threadsafe(self._runner.close(), self._loop)
-			future.result()
-		except RuntimeError as exc:
-			print(f"Warning: failed to close runner cleanly: {exc}", file=sys.stderr)
-		finally:
-			self._loop.call_soon_threadsafe(self._loop.stop)
-			self._thread.join()
-			self._loop.close()
-			self._closed = True
-
 
 
 def _looks_like_image(image_bytes: bytes, mime_type: str) -> bool:
@@ -234,40 +153,7 @@ def _render_dict_response(author: str, response: JsonDict) -> None:
 	_print_status_block(author, response)
 
 
-def _coerce_to_dict(value: Any) -> Dict[str, Any]:
-	if isinstance(value, dict):
-		return value
-	try:
-		return dict(value)  # type: ignore[arg-type]
-	except Exception:  # noqa: BLE001 - best effort conversion
-		return {}
-
-
-def _load_local_env() -> None:
-	env_path = Path(__file__).with_name(".env")
-	if not env_path.exists():
-		return
-
-	try:
-		for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-			line = raw_line.strip()
-			if not line or line.startswith("#"):
-				continue
-			if line.startswith("export "):
-				line = line[len("export ") :].strip()
-			if "=" not in line:
-				continue
-			key, value = line.split("=", 1)
-			key = key.strip()
-			if not key or key in os.environ:
-				continue
-			value = value.strip().strip('"').strip("'")
-			os.environ[key] = value
-	except OSError as exc:
-		print(f"Warning: failed to read {env_path.name}: {exc}", file=sys.stderr)
-
-
-_load_local_env()
+load_local_env(__file__)
 
 
 retry_config = types.HttpRetryOptions(
@@ -619,9 +505,9 @@ def main() -> None:
 		for part in parts:
 			function_call = getattr(part, "function_call", None)
 			if function_call and function_call.name == "adk_request_confirmation":
-				args_dict = _coerce_to_dict(getattr(function_call, "args", {}) or {})
-				original_call = _coerce_to_dict(args_dict.get("originalFunctionCall"))
-				tool_conf = _coerce_to_dict(args_dict.get("toolConfirmation"))
+				args_dict = coerce_to_dict(getattr(function_call, "args", {}) or {})
+				original_call = coerce_to_dict(args_dict.get("originalFunctionCall"))
+				tool_conf = coerce_to_dict(args_dict.get("toolConfirmation"))
 
 				payload = tool_conf.get("payload") if isinstance(tool_conf.get("payload"), dict) else None
 				pending_confirmations[function_call.id] = {
