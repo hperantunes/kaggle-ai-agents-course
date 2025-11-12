@@ -132,6 +132,37 @@ def _looks_like_image(image_bytes: bytes, mime_type: str) -> bool:
 	return True
 
 
+def _safe_b64decode(data: str) -> bytes:
+	"""Decode base64 content while tolerating missing padding."""
+	padding = (-len(data)) % 4
+	if padding:
+		data += "=" * padding
+	return base64.b64decode(data)
+
+
+def _summarize_inline_image(part: Dict[str, Any]) -> Optional[str]:
+	"""Produce a short message describing an inline MCP image payload."""
+	data = part.get("data")
+	if not isinstance(data, str) or not data:
+		return None
+	mime_type = str(part.get("mimeType") or part.get("mime_type") or "image/png")
+	try:
+		image_bytes = _safe_b64decode(data)
+	except (binascii.Error, ValueError) as exc:
+		return f"Inline image payload failed to decode: {exc}"
+
+	if not _looks_like_image(image_bytes, mime_type):
+		status = "header unrecognized"
+	else:
+		status = "looks like a valid image"
+
+	sample = data[:60] + ("..." if len(data) > 60 else "")
+	return (
+		f"Inline image summary: {len(image_bytes)} bytes ({mime_type}, {status}). "
+		f"Sample base64: {sample}"
+	)
+
+
 def _coerce_to_dict(value: Any) -> Dict[str, Any]:
 	if isinstance(value, dict):
 		return value
@@ -192,7 +223,7 @@ async def show_image_summary(
 		}
 
 	try:
-		image_bytes = base64.b64decode(image_base64)
+		image_bytes = _safe_b64decode(image_base64)
 	except (binascii.Error, ValueError) as exc:
 		return {
 			"status": "error",
@@ -492,6 +523,11 @@ def _maybe_render_tool_result(event, verbose: bool) -> None:
 				print(
 					f"{event.author} > Tool returned {text_parts} text parts and {image_parts} image parts."
 				)
+				for entry in response["content"]:
+					if isinstance(entry, dict) and entry.get("type") == "image":
+						summary = _summarize_inline_image(entry)
+						if summary:
+							print(f"{event.author} > {summary}")
 				continue
 			status = response.get("status")
 			message = response.get("message")
