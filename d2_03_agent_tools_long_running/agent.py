@@ -1,12 +1,14 @@
-import asyncio
 import argparse
+import asyncio
+import queue
 import os
 import sys
 import uuid
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Generator, TypeVar, Coroutine
 
 from google.adk import runners as adk_runners
 from google.genai import types
@@ -23,6 +25,108 @@ from mcp import StdioServerParameters
 
 from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.tools.function_tool import FunctionTool
+
+
+T = TypeVar("T")
+
+_LOOP_LOCK = threading.Lock()
+_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_LOOP_THREAD: Optional[threading.Thread] = None
+
+
+def _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _ensure_loop_running() -> asyncio.AbstractEventLoop:
+    global _EVENT_LOOP, _LOOP_THREAD
+    with _LOOP_LOCK:
+        if _EVENT_LOOP and not _EVENT_LOOP.is_closed():
+            return _EVENT_LOOP
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=_loop_worker,
+            args=(loop,),
+            name="shipping-agent-loop",
+            daemon=True,
+        )
+        _EVENT_LOOP = loop
+        _LOOP_THREAD = thread
+        thread.start()
+        return loop
+
+
+def _run_coroutine(coro: Coroutine[Any, Any, T]) -> T:
+    loop = _ensure_loop_running()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result()
+    except KeyboardInterrupt:
+        future.cancel()
+        raise
+
+
+def _stream_agent_events(
+    *,
+    user_id: str,
+    session_id: str,
+    content: types.Content,
+) -> Generator[Any, None, None]:
+    loop = _ensure_loop_running()
+    event_queue: "queue.Queue[Any]" = queue.Queue()
+
+    async def _invoke() -> None:
+        try:
+            async for event in shipping_runner.run_async(
+                user_id=user_id,
+                session_id=session_id,
+                new_message=content,
+            ):
+                event_queue.put(event)
+        except BaseException as exc:  # noqa: BLE001 - propagate async errors to caller
+            event_queue.put(exc)
+        finally:
+            event_queue.put(None)
+
+    asyncio.run_coroutine_threadsafe(_invoke(), loop)
+
+    pending_exc: Optional[BaseException] = None
+    while True:
+        item = event_queue.get()
+        if item is None:
+            break
+        if isinstance(item, BaseException):
+            pending_exc = item
+            continue
+        yield item
+
+    if pending_exc is not None:
+        raise pending_exc
+
+
+def _shutdown_loop() -> None:
+    global _EVENT_LOOP, _LOOP_THREAD
+    with _LOOP_LOCK:
+        loop = _EVENT_LOOP
+        thread = _LOOP_THREAD
+        if not loop:
+            return
+        if loop.is_closed():
+            _EVENT_LOOP = None
+            _LOOP_THREAD = None
+            return
+        loop.call_soon_threadsafe(loop.stop)
+
+    if thread and thread.is_alive():
+        thread.join()
+
+    with _LOOP_LOCK:
+        if loop and not loop.is_closed():
+            loop.close()
+        _EVENT_LOOP = None
+        _LOOP_THREAD = None
 
 
 def _load_local_env() -> None:
@@ -169,10 +273,15 @@ shipping_runner = Runner(
 def _close_runner() -> None:
     """Close the runner, reporting cleanup issues to stderr."""
 
+    if _EVENT_LOOP is None or _EVENT_LOOP.is_closed():
+        return
+
     try:
-        asyncio.run(shipping_runner.close())
+        _run_coroutine(shipping_runner.close())
     except RuntimeError as exc:
         print(f"Warning: failed to close runner cleanly: {exc}", file=sys.stderr)
+    finally:
+        _shutdown_loop()
 
 
 async def _ensure_session(user_id: str, session_id: str) -> None:
@@ -305,12 +414,12 @@ def main() -> None:
                 pending_confirmations.pop(function_response.id, None)
 
     def _send_content(content: types.Content) -> None:
-        asyncio.run(_ensure_session(args.user, session_id))
         try:
-            for event in shipping_runner.run(
+            _run_coroutine(_ensure_session(args.user, session_id))
+            for event in _stream_agent_events(
                 user_id=args.user,
                 session_id=session_id,
-                new_message=content,
+                content=content,
             ):
                 adk_runners.print_event(event, verbose=args.verbose)
                 _maybe_render_tool_result(event, args.verbose)
