@@ -121,9 +121,9 @@ root_agent = LlmAgent(
     instruction="""Your task is to find research papers and count them. 
 
     You MUST ALWAYS follow these steps:
-    1) Find research papers on the user provided topic using the 'google_search_agent'. 
-    2) Cleanly structure the search results as a JSON array of paper titles and pass that list to 'count_papers'.
-    3) Return both the list of research papers and the total number of papers.
+    1) Find research papers on the user provided topic using ONLY the 'google_search_agent'. 
+    2) Whenever new papers are found, cleanly structure the results as a JSON array of paper titles and immediately call 'count_papers'.
+    3) Never skip step 2. Your final response MUST include both the JSON list and the total number of papers returned by 'count_papers'.
     """,
     tools=[AgentTool(agent=google_search_agent), count_papers]
 )
