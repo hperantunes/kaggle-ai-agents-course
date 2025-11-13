@@ -2,10 +2,14 @@ import asyncio
 import queue
 import sys
 import threading
-from typing import Any, Coroutine, Generator, Optional
+from typing import Any, Coroutine, Generator, Optional, AsyncGenerator, TYPE_CHECKING
 
 from google.adk.runners import Runner
 from google.genai import types
+
+
+if TYPE_CHECKING:
+    from google.adk.runners import RunConfig
 
 
 class RunnerBridge:
@@ -90,3 +94,55 @@ class RunnerBridge:
             self._thread.join()
             self._loop.close()
             self._closed = True
+
+
+class AutoSessionRunner(Runner):
+    """Runner that creates sessions on first use when needed."""
+
+    async def _ensure_session(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        allow_create: bool,
+    ) -> None:
+        session = await self.session_service.get_session(
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if session is None:
+            if not allow_create:
+                message = self._format_session_not_found_message(session_id)
+                raise ValueError(message)
+            await self.session_service.create_session(
+                app_name=self.app_name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+    async def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: Optional[str] = None,
+        new_message: Optional[types.Content] = None,
+        state_delta: Optional[dict[str, Any]] = None,
+        run_config: Optional["RunConfig"] = None,
+    ) -> AsyncGenerator[Any, None]:
+        allow_create = new_message is not None or invocation_id is None
+        await self._ensure_session(
+            user_id=user_id,
+            session_id=session_id,
+            allow_create=allow_create,
+        )
+        async for event in super().run_async(
+            user_id=user_id,
+            session_id=session_id,
+            invocation_id=invocation_id,
+            new_message=new_message,
+            state_delta=state_delta,
+            run_config=run_config,
+        ):
+            yield event

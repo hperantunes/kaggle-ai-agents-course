@@ -1,27 +1,26 @@
-import argparse
 import json
 import sys
-import uuid
 from pathlib import Path
 from typing import Any, Iterable, List
 
-from google.adk import runners as adk_runners
 from google.adk.agents import LlmAgent
+from google.adk.apps.app import App
 from google.adk.models.google_llm import Gemini
 from google.adk.plugins.logging_plugin import (
     LoggingPlugin,
 )  # <---- 1. Import the Plugin
-from google.adk.runners import InMemoryRunner
+from google.adk.sessions import InMemorySessionService
 from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.google_search_tool import google_search
 from google.genai import types
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APP_MODULE_NAME = f"{Path(__file__).parent.name}"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.common import load_local_env
-from utils.runner_bridge import RunnerBridge
+from utils.runner_bridge import AutoSessionRunner
 
 load_local_env(__file__)
 
@@ -116,7 +115,7 @@ google_search_agent = LlmAgent(
 
 
 # Root agent
-research_agent_with_plugin = LlmAgent(
+root_agent = LlmAgent(
     name="research_paper_finder_agent",
     model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
     instruction="""Your task is to find research papers and count them. 
@@ -129,123 +128,28 @@ research_agent_with_plugin = LlmAgent(
     tools=[AgentTool(agent=google_search_agent), count_papers]
 )
 
-runner = InMemoryRunner(
-    agent=research_agent_with_plugin,
-    plugins=[
-        LoggingPlugin()
-    ],  # <---- 2. Add the plugin. Handles standard Observability logging across ALL agents
+app = App(
+    name=APP_MODULE_NAME,
+    root_agent=root_agent,
+    plugins=[LoggingPlugin()],
+)
+
+session_service = InMemorySessionService()
+
+runner = AutoSessionRunner(
+    app=app,
+    session_service=session_service,
 )
 
 
-async def _ensure_session(*, user_id: str, session_id: str) -> None:
-    session_service = runner.session_service
-    session = await session_service.get_session(
-        app_name=runner.app_name,
-        user_id=user_id,
-        session_id=session_id,
-    )
-    if session is None:
-        await session_service.create_session(
-            app_name=runner.app_name,
-            user_id=user_id,
-            session_id=session_id,
-        )
-
-
-def _dispatch_user_message(
-    *,
-    bridge: RunnerBridge,
-    user_id: str,
-    session_id: str,
-    message: str,
-    verbose: bool,
-) -> None:
-    content = types.Content(role="user", parts=[types.Part(text=message)])
-    try:
-        bridge.run(
-            _ensure_session(
-                user_id=user_id,
-                session_id=session_id,
-            )
-        )
-        for event in bridge.stream_events(
-            user_id=user_id,
-            session_id=session_id,
-            content=content,
-        ):
-            adk_runners.print_event(event, verbose=verbose)
-    except Exception as exc:  # noqa: BLE001 - surface runtime issues for CLI users
-        print(f"Error while running agent: {exc}", file=sys.stderr)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(
+    from utils.console import run_cli
+
+    run_cli(
+        runner=runner,
         description="Run the logging-in-production agent from the console.",
+        intro_message="Starting interactive session with logging agent. Type 'exit' or 'quit' to leave.",
     )
-    parser.add_argument(
-        "-m",
-        "--message",
-        help="Optional one-shot prompt to send to the agent. Leave blank for interactive mode.",
-    )
-    parser.add_argument(
-        "--session",
-        help="Optional session identifier so you can resume a prior run.",
-    )
-    parser.add_argument(
-        "--user",
-        default="cli_user",
-        help="Identifier attached to events emitted by this CLI user (default: cli_user).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show raw tool call details emitted by the agent.",
-    )
-    args = parser.parse_args()
-
-    session_id = args.session or str(uuid.uuid4())
-    bridge = RunnerBridge(runner)
-
-    if args.message:
-        try:
-            _dispatch_user_message(
-                bridge=bridge,
-                user_id=args.user,
-                session_id=session_id,
-                message=args.message,
-                verbose=args.verbose,
-            )
-        finally:
-            bridge.close()
-        return
-
-    print("Starting interactive session with logging agent. Type 'exit' or 'quit' to leave.")
-    print(f"Session ID: {session_id}")
-
-    try:
-        while True:
-            try:
-                user_input = input("you> ").strip()
-            except EOFError:
-                print()
-                break
-
-            if not user_input:
-                continue
-            if user_input.lower() in {"exit", "quit"}:
-                break
-
-            _dispatch_user_message(
-                bridge=bridge,
-                user_id=args.user,
-                session_id=session_id,
-                message=user_input,
-                verbose=args.verbose,
-            )
-    except KeyboardInterrupt:
-        print("\nSession interrupted by user.")
-    finally:
-        bridge.close()
 
 
 if __name__ == "__main__":
