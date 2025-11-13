@@ -66,5 +66,6 @@ root_agent = LlmAgent(
     tools=[AgentTool(agent=google_search_agent), count_papers]
 )
 
-# Run agent in web mode as:
+# Run agent in web mode with:
 # adk web --log_level DEBUG
+# Use in the prompt: "Find latest quantum computing papers"
