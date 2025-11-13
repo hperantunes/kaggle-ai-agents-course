@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 
@@ -7,7 +8,7 @@ from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.google_search_tool import google_search
 
 from google.genai import types
-from typing import List
+from typing import Any, Iterable, List
 
 # Clean up any previous logs
 for log_file in ["logger.log", "web.log", "tunnel.log"]:
@@ -29,16 +30,77 @@ retry_config = types.HttpRetryOptions(
     http_status_codes=[429, 500, 503, 504],  # Retry on these HTTP errors
 )
 
-# ---- Intentionally pass incorrect datatype - `str` instead of `List[str]` ----
-def count_papers(papers: str):
+# ---- Handle potential incorrect datatype returned by the agent ----
+def _normalize_papers(raw_papers: Any) -> List[str]:
+    """Normalize tool input into a clean list of paper titles."""
+
+    def _split_lines(text: str) -> List[str]:
+        cleaned = []
+        for line in text.splitlines():
+            entry = line.strip(" -\t•")
+            if entry:
+                cleaned.append(entry)
+        return cleaned
+
+    normalized: List[str] = []
+
+    if isinstance(raw_papers, str):
+        candidate = raw_papers.strip()
+        if not candidate:
+            return []
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            normalized.extend(_split_lines(candidate))
+        else:
+            if isinstance(parsed, list):
+                for item in parsed:
+                    entry = str(item).strip()
+                    if entry:
+                        normalized.append(entry)
+            else:
+                normalized.extend(_split_lines(candidate))
+        return normalized
+
+    if not isinstance(raw_papers, Iterable):
+        return normalized
+
+    for item in raw_papers:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            if "\n" in text:
+                normalized.extend(_split_lines(text))
+            else:
+                normalized.append(text)
+        else:
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    clean_entry = str(entry).strip()
+                    if clean_entry:
+                        normalized.append(clean_entry)
+            else:
+                normalized.extend(_split_lines(text))
+
+    return normalized
+
+
+def count_papers(papers: List[str]):
+    """Count how many distinct paper titles were discovered.
+
+    The agent occasionally sends a single string (e.g. bullet list or JSON) or
+    a sequence of strings. We coerce the value into a list before counting to
+    ensure the total reflects the actual number of papers.
     """
-    This function counts the number of papers in a list of strings.
-    Args:
-      papers: A list of strings, where each string is a research paper.
-    Returns:
-      The number of papers in the list.
-    """
-    return len(papers)
+
+    normalized_papers = _normalize_papers(papers)
+    logging.debug("Normalized papers: %s", normalized_papers)
+    return len(normalized_papers)
 
 
 # Google Search agent
@@ -60,7 +122,7 @@ root_agent = LlmAgent(
 
     You MUST ALWAYS follow these steps:
     1) Find research papers on the user provided topic using the 'google_search_agent'. 
-    2) Then, pass the papers to 'count_papers' tool to count the number of papers returned.
+    2) Cleanly structure the search results as a JSON array of paper titles and pass that list to 'count_papers'.
     3) Return both the list of research papers and the total number of papers.
     """,
     tools=[AgentTool(agent=google_search_agent), count_papers]
