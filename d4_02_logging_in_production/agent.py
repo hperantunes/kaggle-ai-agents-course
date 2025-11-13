@@ -155,3 +155,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+
+# This agent can be run from both the console and adk web
